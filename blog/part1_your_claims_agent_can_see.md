@@ -4,6 +4,8 @@
 
 *Part 1 of a two-part series on evaluating and governing multimodal AI agents. All code in this post runs against a working demo — the failures you'll see are real agent failures, caught by real judges.*
 
+A quick primer before we dive in: **MLflow** is the open-source platform for managing the ML and GenAI lifecycle — experiment tracking, model registry, and, most relevant here, *tracing*: capturing every step an agent takes (each LLM call, tool invocation, input, and output) as a structured, inspectable record. An **LLM judge** is an evaluation technique that uses a language model to grade another model's outputs against instructions you define — "LLM-as-a-judge" — so you can score thousands of agent runs without a human reading each one. Everything below uses MLflow's built-in judge APIs and runs on **Databricks managed MLflow**, which adds the production plumbing you'd otherwise build yourself: hosted tracking, a Review App for human labeling, and trace storage in Unity Catalog Delta tables — governed like any other data asset and queryable from notebooks, SQL, or dashboards.
+
 ---
 
 ## A claim that should never have been fast-tracked
