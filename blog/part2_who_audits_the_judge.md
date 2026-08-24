@@ -1,190 +1,158 @@
 # Who Audits the Judge? Calibrating LLM Judges for Regulated AI
 
-**Aligning MLflow judges with human experts — review queues, agreement measurement, and judge alignment**
+**Aligning MLflow judges with human experts: review queues, agreement measurement, and judge alignment**
 
-*Part 2 of a two-part series on evaluating and governing multimodal AI agents. [Part 1](BLOG_PART1_DRAFT.md) gave our judges eyes; this post gives someone a reason to trust them. As in Part 1, every number and quote below comes from a working demo — the agreement rates are real measurements, and the judge's mistakes are real mistakes.*
+*Part 2 of two. [Part 1](https://medium.com/p/66103ca690c2) gave our judges eyes. This one asks whether they can be trusted. Every number below is a measurement from a working demo.*
+
+*A primer, in case you arrived here first: MLflow is the open-source platform for the ML and GenAI lifecycle, and its tracing records every step an agent takes — LLM calls, tool calls, inputs, outputs. An LLM judge is a language model that grades another model's output against instructions you write, so you can score thousands of runs without reading each one. This demo runs on Databricks managed MLflow, which adds a hosted Review App for human labeling, judge alignment APIs, and trace storage in Unity Catalog Delta tables.*
 
 ---
 
-## Three months later, the auditor shows up
+## Nobody had checked the judge
 
-At the end of Part 1, our P&C insurer had something most teams would envy: an FNOL intake agent whose severity calls were being checked by an LLM judge with actual access to the evidence. The judge caught the fast-tracked claim with the shattered windshield. It caught the fire damage in the photo the agent never opened. The eval dashboard was green where it should be green and red where it should be red.
+In Part 1, an insurance claims agent got an LLM judge that could see the damage photos. It caught the claim that was fast-tracked with a shattered windshield, and the fire damage in a photo the agent never opened.
 
-Then the model-risk review lands on the calendar, and the first question is not about the agent at all. It's about the judge: *on whose authority does this thing decide what "severe" means?*
+Then the obvious question: who checked the judge? Its severity rubric was written by an engineer in an afternoon. Nobody had compared its verdicts against an adjuster's.
 
-It's a fair question. The judge's severity rubric was written by an ML engineer in an afternoon — minor is cosmetic, severe means not safely drivable, pass unless the photos clearly contradict the agent. Reasonable words. But "reasonable words" is not how regulated institutions establish that an automated control works. They establish it by comparison against the people accountable for the same decision — and nobody had ever put this judge's verdicts in front of an adjuster.
+So we did. We grew the portfolio to 20 claims (alignment needs at least 10 labeled traces) and reran the agent, which fast-tracked all four severe claims whose claimants called them fender benders. A senior adjuster then reviewed all 20 judge verdicts against the photos.
 
-So that's what we did. We grew the claims portfolio from 8 to 20 (alignment, which we'll get to, needs at least 10 labeled traces), ran the same buggy agent over all of them — it dutifully fast-tracked all four severe claims whose claimants said "fender bender" — and queued every trace for expert review in an MLflow labeling session. A senior adjuster reviewed all 20 of the judge's verdicts against the photos.
+**The adjuster disagreed with 6 of 20 — 70% agreement, Cohen's κ of 0.40.**
 
-**The adjuster disagreed with 6 of the 20 — a 70% agreement rate, Cohen's κ of 0.40.** The judge that had been silently gating this pipeline agreed with the domain expert at a rate that, corrected for chance, is charitably described as "moderate."
+## The disagreements had a pattern
 
-That number is the subject of this post: where it comes from, why it isn't a bug, how MLflow measures it, and how — using judge alignment — we drove it to 100% on a holdout the optimizer never saw, and kept the receipts.
+All six went the same direction: the judge failed claims the adjuster passed. Three causes.
 
-## What the disagreement actually looked like
+**It audited something it wasn't asked to.** Several claims have descriptions that don't match their photos. The judge treated that as a severity failure:
 
-Here is the part that should worry anyone running an uncalibrated judge in production: the disagreement wasn't noise. It was *structured*. All six disagreements ran the same direction — the judge failed claims the adjuster passed — and they fell into three patterns, each visible in the paired rationales the audit produced.
+> *"The severity classification cannot be reliably made when the damage location contradicts the reported accident circumstances."*
 
-**Pattern 1: scope creep.** Several claims in our synthetic portfolio have descriptions that don't match their photos (a "rear-ended at a stop sign" story attached to front-end damage). The judge seized on these. On CLM-2006 it wrote:
+The adjuster drew a line:
 
-> *"The severity classification cannot be reliably made when the damage location contradicts the reported accident circumstances. This requires investigation before severity can be properly assessed, and the agent failed to identify or note this critical discrepancy."*
+> *"The severity call matches the photos... The rear-end story not matching front-end photos is a fraud-referral flag, and I've noted it - but it is not a severity-classification failure, which is what this audit measures."*
 
-The adjuster's response is a small masterclass in mandate discipline:
+Narrative checks belong in a fraud workflow with their own judge. Folded into a severity check, they just produce false alarms.
 
-> *"The severity call matches the photos: buckled hood, deformed fender, structural deformation toward the A-pillar — severe is defensible. The rear-end story not matching front-end photos is a fraud-referral flag, and I've noted it — but it is not a severity-classification failure, which is what this audit measures."*
+**It ignored its own tolerance rule.** The instructions say calls one category apart should pass. It failed two bumper claims anyway:
 
-The judge wasn't wrong that something was off. It was wrong about *whose job it was*. Narrative-consistency checking belongs to a fraud workflow with its own judge and its own escalation path — not smuggled into a severity check where a "fail" means a false alarm on a correctly-classified claim. An uncalibrated judge doesn't just apply your rubric imperfectly; it quietly expands its own jurisdiction.
+> *"Bumper cover deformed with a missing section - that's a cover replacement, roughly $900 on this car. Whether you file it minor or moderate is a coin flip; not a fail."*
 
-**Pattern 2: violating its own tolerance rule.** The judge's instructions explicitly grant adjacent-category tolerance — borderline calls one category apart should pass. It failed CLM-1002 and CLM-2004 anyway, both minor-vs-moderate bumper calls. The adjuster:
+That's repair economics, and no drivability rubric contains it.
 
-> *"Bumper cover deformed with a missing section — that's a cover replacement, roughly $900 on this car. Whether you file it minor or moderate is a coin flip; not a fail. Dramatic-looking bumper damage is routine repair work."*
+**It read the background as damage.** On one claim the photo notes mentioned a salvage yard, and the judge used that as evidence the car wasn't roadworthy. The adjuster: *"background context isn't damage evidence."*
 
-That sentence encodes something no drivability rubric contains: repair economics. Bumper covers photograph terribly and fix cheaply. An expert knows this; a generic judge reads "deformed, missing section" and reaches for the fail button.
+![Confusion matrix](assets/table_p2_confusion.png)
 
-**Pattern 3: treating context as evidence.** On CLM-2002, the perception notes mentioned the vehicle appeared to be photographed in a salvage yard, and the judge argued this "suggests it is not currently roadworthy" — grounds to demand a severe classification. The adjuster: *"I don't buy 'severe' off the salvage-yard backdrop — background context isn't damage evidence."* (Our CC0 photo dataset is full of salvage-yard shots; a production judge fed dashcam or bodyshop photos will find equivalent spurious context of its own.)
+*The judge caught every claim the adjuster failed, and flagged six it shouldn't have.*
 
-Now the crucial observation. Look at the confusion matrix for all 20 claims:
+Zero misses, six false alarms. Nothing dangerous slipped through, but a gate that flags a third of correct work gets overridden, then ignored.
 
-| | Adjuster: pass | Adjuster: fail |
-|---|---|---|
-| **Judge: pass** | 10 | **0** |
-| **Judge: fail** | 6 | 4 |
+One more result worth knowing: rerunning the same judge on the same inputs scored 75% instead of 70%. One verdict flipped between identical runs. An uncalibrated judge isn't even consistent with itself.
 
-Zero misses, six false alarms. The judge caught every claim the adjuster failed — all four fast-tracked severe claims — and then failed six more that a domain expert waves through. This is the *good* failure mode, and it still isn't free: a deployment gate that cries wolf on 30% of correct behavior gets overridden, then ignored, and an ignored gate is no gate at all. That's precisely why we report agreement *direction* and not just the headline rate: a too-lenient judge is a hole in your gate; a too-strict judge is a slow leak in your team's trust.
+## Collecting expert labels
 
-One more honesty datapoint from the run: when we re-executed the *identical* baseline judge on the identical inputs during the before/after evaluation, it scored 75% instead of 70% — one verdict flipped between runs. An uncalibrated judge isn't even guaranteed to agree with *itself*. Keep that in mind whenever a single green eval run is offered as evidence of anything.
-
-## The audit loop: Review Queues
-
-None of the above required heroics to collect. MLflow's labeling sessions (surfaced to reviewers as the **Review App**) turn "we should get expert feedback" into an actual queue with an owner. You define a *label schema* — the exact question the expert answers — create a session, assign it, and add traces:
+MLflow labeling sessions turn this into a queue with an owner:
 
 ```python
 import mlflow.genai.labeling as labeling
 import mlflow.genai.label_schemas as schemas
 from mlflow.genai.label_schemas import InputCategorical
-
 schemas.create_label_schema(
-    name="damage_fidelity",   # ← must match the judge's name; more on this below
+    # must match the judge's name
+    name="damage_fidelity",
     type="feedback",
-    title="Is the agent's severity classification consistent with the submitted damage photos?",
+    title=("Is the agent's severity classification "
+           "consistent with the submitted photos?"),
     input=InputCategorical(options=["pass", "fail"]),
-    instruction="Open ingest_evidence to view every submitted photo. Always explain your reasoning.",
+    instruction=("Open ingest_evidence to view every "
+                 "photo. Always explain your reasoning."),
     enable_comment=True,
 )
-
 session = labeling.create_labeling_session(
     name="adjuster_audit_2026_08",
     assigned_users=["senior.adjuster@insurer.com"],
     label_schemas=["damage_fidelity"],
 )
-session.add_traces(traces)   # the same 20 agent traces the judge scored
+session.add_traces(traces)   # the 20 scored traces
 ```
 
-![Review App labeling item with the damage_fidelity schema question](assets/screenshot_review_app_item.png)
+Two details do the work. The schema name matches the judge name, so both verdicts land on the same trace as assessments and nothing needs joining later. And the photos are already on the trace from Part 1's `ingest_evidence` span, so the adjuster sees the evidence next to the verdict.
 
-*Figure 1: The Review App queue. The adjuster sees the claim intake, the agent's output, and one structured question — with a required comment. Those comments turn out to be the most valuable artifact in this entire post.*
+![Review App](assets/screenshot_review_app_item.png)
 
-Two design choices here are quietly load-bearing.
+*The Review App: claim data, the agent's output, one question, and a required comment.*
 
-First, **the schema name equals the judge name**. In MLflow, both the judge's verdict and the human's label are *assessments* attached to the same trace; everything downstream — agreement measurement, alignment, re-audit — works by comparing same-named assessments from two different sources (`LLM_JUDGE` and `HUMAN`). Name them identically and the trace itself is the join key. No reconciliation spreadsheet exists anywhere in this workflow.
+![Traces with both verdicts](assets/screenshot_traces_dual_verdicts.png)
 
-Second — and this is Part 1's `ingest_evidence` pattern paying off exactly where we promised it would — **the evidence is on the trace**. The adjuster auditing CLM-1004 sees the shattered windshield right next to the agent's "minor / fast-track" verdict, because every submitted photo landed on the trace as an `mlflow-attachment://` reference whether or not the agent looked at it. Without that design decision, "expert review" would mean emailing photo folders around. With it, visual auditing is just... reviewing a trace.
+*One assessment name, two sources. Rows with both pass and fail chips are disagreements.*
 
-![Traces list with judge and adjuster verdicts on the same assessment](assets/screenshot_traces_dual_verdicts.png)
+## A constraint, and a better design
 
-*Figure 2: The money shot for Part 2. One `damage_fidelity` column, two sources: rows with a single chip are agreements; rows showing both `pass` and `fail` are the judge and the adjuster disagreeing about the same trace. The column summary reads 67% pass / 33% fail across verdicts.*
-
-## The constraint that turned out to be a design lesson
-
-Here's the part where we have to be straight with you about how the sausage gets made.
-
-MLflow's judge alignment currently supports **field-based judges** — ones templated on `{{ inputs }}` and `{{ outputs }}` — but not the agentic `{{ trace }}` judges from Part 1 that explore spans and fetch images with `get_span_image`. Our vision judge, as written, cannot be aligned today.
-
-Our first reaction was that this broke the story. Our considered reaction is that it forced an architecture we should have wanted anyway. We split the severity judge into two layers:
-
-- **Perception (frozen):** a vision pass that turns every submitted photo into neutral, factual damage notes — components affected, deformation, glass, airbag evidence, apparent drivability. No severity opinion. This layer is the judge's eyes, and eyes don't need calibrating; they need to be *accurate*, which is a regression-testable property on a fixed photo set.
-- **Judgment (alignable):** a field-based judge that applies the severity policy to those notes plus the claim context. This layer is pure policy — and policy is exactly the thing expert feedback should reshape.
+MLflow's alignment works on field-based judges (`{{ inputs }}`, `{{ outputs }}`), not the `{{ trace }}` judges from Part 1. So we split the judge in two: a frozen perception pass that turns every photo into factual notes, and a field-based judgment layer that applies the severity policy.
 
 ```python
 damage_fidelity = make_judge(
     name="damage_fidelity",
     instructions=(
-        "You are auditing an auto insurance FNOL agent's damage severity classification.\n"
-        "Claim intake data and evidence notes: {{ inputs }}\n"
+        "You are auditing an FNOL agent's damage "
+        "severity classification.\n"
+        "Claim data and evidence notes: {{ inputs }}\n"
         "Agent output: {{ outputs }}\n"
-        "The inputs contain the claimant's description and 'photo_notes' - factual damage "
-        "notes written by a separate perception system that inspected EVERY photo the "
-        "claimant submitted. Treat the photo notes as reliable evidence...\n"
-        "Severity rubric: minor = cosmetic; moderate = significant panel damage, drivable; "
-        "severe = structural/frame damage, not safely drivable.\n"
-        "Adjacent-category tolerance: borderline calls one category apart should 'pass'..."
+        "'photo_notes' are factual notes from a "
+        "perception system that inspected EVERY "
+        "submitted photo. Treat them as reliable.\n"
+        "Rubric: minor = cosmetic; moderate = panel "
+        "damage, drivable; severe = structural, not "
+        "safely drivable.\n"
+        "Calls one category apart should 'pass'."
     ),
     feedback_value_type=Literal["pass", "fail"],
     model="databricks:/databricks-claude-sonnet-4-5",
 )
 ```
 
-Notice what the split buys in a regulated setting. The calibratable layer is now entirely **text-auditable** — a compliance reviewer can read the judgment judge's full input and its rationale without re-running a vision model. The perception layer can be validated the way perception should be: against ground truth, independently of any policy question. And when the judge's behavior changes after alignment, you know *exactly which layer changed*, because only one of them can.
+We'd keep the split regardless. The policy layer is text-auditable, the perception layer can be tested against ground truth, and when behavior changes you know which half moved.
 
-We'd argue for this decomposition even after trace-based alignment ships: "the judge saw X" and "given X, the judge decided Y" are different claims, and a governance story is stronger when you can defend them separately.
-
-## Aligning the judge
-
-With 20 traces carrying both verdicts, alignment is a few lines. We used **MemAlign**, the default optimizer, which learns from the *rationales* the expert wrote, not just the labels — it distills generalizable guidelines into the judge's semantic memory and keeps hard cases as episodic examples:
+## Alignment
 
 ```python
-from mlflow.genai.judges.optimizers import MemAlignOptimizer
-
+from mlflow.genai.judges.optimizers import (
+    MemAlignOptimizer)
 optimizer = MemAlignOptimizer(
     reflection_lm="databricks:/databricks-claude-sonnet-4-5",
-    embedding_model="databricks:/databricks-gte-large-en",  # default embedder is OpenAI; point it at your endpoint
+    # the default embedder is OpenAI
+    embedding_model="databricks:/databricks-gte-large-en",
 )
-aligned_judge = damage_fidelity.align(alignment_traces, optimizer)   # 14 traces, stratified
+aligned_judge = damage_fidelity.align(
+    alignment_traces, optimizer)     # 14 traces
 aligned_judge.register(experiment_id=experiment_id)
 ```
 
-We aligned on 14 traces and held out 6 — stratified so the holdout kept the pass/fail mix (five passes including two baseline false alarms, plus CLM-1004 itself).
-
-This is why we insisted the adjuster write a comment on every label. A bare "fail" teaches the optimizer *that* it was wrong; a sentence teaches it *why*, and the sentence generalizes. MemAlign distilled the adjuster's 20 comments into eleven guidelines appended to the judge's memory. Read four of them — verbatim from the aligned judge — next to the disagreement patterns above:
+MemAlign learns from the written rationales, not just pass/fail, which is why every label needed a comment. It turned the adjuster's 20 comments into 11 guidelines. Four of them:
 
 > *"Bumper cover damage, even when visually dramatic with cracking or missing sections, is often routine repair work and can reasonably be classified as minor or moderate without being a fail."*
->
-> *"When photo evidence contradicts the claimant's story about accident location or type (e.g., 'rear-ended' but photos show front-end damage), this is a fraud-referral flag but not itself a severity classification failure."*
->
+
+> *"When photo evidence contradicts the claimant's story about accident location or type, this is a fraud-referral flag but not itself a severity classification failure."*
+
 > *"Background context in photos (e.g., salvage yard setting) should not be used as evidence of damage severity; only the actual vehicle damage visible in the photos counts."*
->
+
 > *"Fire damage rendering a vehicle non-roadworthy must never be fast-tracked as minor regardless of other photo angles showing intact areas."*
 
-That is expertise transfer with a paper trail: each learned rule traces back to a named expert's written rationale on a specific claim. Pattern 1, 2, and 3 each got their own guideline — and the fourth quote shows the optimizer *also* reinforced the boundaries that must never soften.
+![Before and after](assets/table_p2_beforeafter.png)
 
-And the before/after:
+*Agreement before and after alignment, on a holdout the optimizer never saw.*
 
-| Agreement with the adjuster | Baseline judge | Aligned judge |
-|---|---|---|
-| Holdout (6 claims, never seen by optimizer) | 67% (4/6) | **100% (6/6)** |
-| Full set (20 claims) | 75% (15/20) | **100% (20/20)** |
+Both holdout flips were former false alarms. All four genuine failures still fail, so calibration removed the noise without buying leniency. Caveat: 20 claims and one reviewer. Encouraging, not conclusive.
 
-The two holdout flips are exactly the ones you'd want: CLM-1001 and CLM-1002, both baseline false alarms, both now passing with rationales that read like the adjuster taught them — the aligned judge calls CLM-1002 *"a classic borderline case... still routine repair work."* Just as important is what *didn't* flip: all four genuinely failed claims — the shattered windshield, the fire damage, both fender-bender fast-tracks — still fail after alignment. Calibration removed the false alarms without buying leniency where it matters.
+## What this gives an auditor
 
-The honest caveats: this is 20 claims and one expert. A 6-claim holdout going 6-for-6 is an encouraging result, not a statistical guarantee, and a production calibration should run on a bigger sample with multiple reviewers and inter-rater checks. But the *mechanics* are exactly what you'd run at scale — and the mechanics are the point.
+A named expert reviewed every verdict in a versioned session. The gap is a number with a direction, stored in tables. The learned rules are readable text you can trace back to a specific claim. The aligned judge is registered. And the loop runs again next quarter.
 
-## What "governed" actually means here
+"We use AI to check our AI" is not a control. This is.
 
-Step back and inventory what this loop produced, because the artifacts *are* the governance story:
+## Closing
 
-- **A named expert reviewed every verdict** in a versioned queue. The labeling session is an MLflow run with an owner, a timestamp, and every label attached to its trace. That's your evidence of independent validation.
-- **The disagreement is quantified and directional** — 70% agreement, κ 0.40, zero-miss/six-false-alarm confusion — stored as tables (`adjuster_labels`, `alignment_results`), comparable across audits. "The judge is 100% aligned with our senior adjuster on the audit set, up from 70%, with false alarms eliminated and zero missed failures" is a sentence a model-risk officer can work with. "We use AI to check our AI" is not.
-- **The improvement is attributable.** MemAlign's learned guidelines are readable text. You can show an auditor the exact sentences of expertise that were added and which expert rationale each came from.
-- **The judge is versioned.** `aligned_judge.register()` puts the calibrated judge under experiment-scoped registration. The judge gating today's deployment is a specific, retrievable artifact, not a prompt in someone's notebook.
-- **The loop has a cadence.** When standards evolve or the adjuster changes, you re-queue, re-measure, re-align — and the agreement metric becomes a time series. The deliverable of this exercise is not an aligned judge; it's a repeatable audit loop with numbers attached. The aligned judge is just this quarter's output of it.
-
-The pattern generalizes exactly as far as Part 1's did. Medical intake pipelines calibrating against clinician review, compliance summarizers calibrating against counsel, computer-use agents calibrating against QA leads — anywhere an LLM judge gates decisions a named human is accountable for, "who audits the judge?" has this same shape of answer: queue, measure, align, register, repeat.
-
-## Series close: eyes, then trust
-
-Two posts, one claims agent, one arc. Part 1 argued that if your agent consumes images, a judge that consumes only text is systematically miscalibrated — and gave the judge eyes with multimodal traces and `get_span_image`. But a judge with eyes is just a second opinion from a stranger. Part 2 put that stranger in front of the expert whose job it imitates, measured a 30% disagreement no dashboard would ever have surfaced, taught it what the expert knows, and filed the paperwork.
-
-If the input is visual, the eval must be visual. And if the eval gates real decisions, the eval itself must be audited — by someone whose name goes on the line.
+Part 1: if the input is visual, the eval has to be visual. Part 2: if the eval gates real decisions, someone has to audit the eval.
 
 ---
 
-*The full demo — dataset builder, agent, both judge suites from Part 1, and this calibration workflow — is a four-notebook MLflow project on Databricks; code, notebooks, and figures are at [github.com/Anubhav02/Mlflow_vision](https://github.com/Anubhav02/Mlflow_vision) (labeling sessions and the Review App are Databricks-managed MLflow features; judge alignment is available in open-source MLflow). Requires MLflow ≥ 3.15; at time of writing, MemAlign's dependencies need `pydantic<2.13` and `litellm<1.80` pinned, and its default embedder is OpenAI — point `embedding_model` at a Databricks embedding endpoint. Damage photos are from the Humans in the Loop "Car Parts and Car Damages" dataset (CC0 1.0); claims and forms are synthetic. The "senior adjuster" is a persona: labels were applied by the author through the labeling workflow against a documented adjuster rubric (severity-vs-photos only; adjacent-category tolerance; narrative mismatches referred to fraud review rather than failed) — in a production calibration, put a licensed adjuster in the queue.*
+*Code, notebooks, and figures: [github.com/Anubhav02/Mlflow_vision](https://github.com/Anubhav02/Mlflow_vision). Requires MLflow ≥ 3.15 on Databricks. MemAlign currently needs `pydantic<2.13` and `litellm<1.80` pinned, and its default embedder is OpenAI — point `embedding_model` at a Databricks endpoint. Damage photos are CC0 (Humans in the Loop); claims and forms are synthetic. The "senior adjuster" is a persona: labels were applied by the author through the labeling workflow against a documented adjuster rubric. In a production calibration, put a licensed adjuster in the queue.*
