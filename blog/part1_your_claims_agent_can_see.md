@@ -2,111 +2,88 @@
 
 **Evaluating multimodal agents with MLflow's vision-capable judges**
 
-*Part 1 of a two-part series on evaluating and governing multimodal AI agents. All code in this post runs against a working demo — the failures you'll see are real agent failures, caught by real judges.*
+*Part 1 of two. All code here runs against a working demo — the failures are real agent failures, caught by real judges.*
 
-A quick primer before we dive in: **MLflow** is the open-source platform for managing the ML and GenAI lifecycle — experiment tracking, model registry, and, most relevant here, *tracing*: capturing every step an agent takes (each LLM call, tool invocation, input, and output) as a structured, inspectable record. An **LLM judge** is an evaluation technique that uses a language model to grade another model's outputs against instructions you define — "LLM-as-a-judge" — so you can score thousands of agent runs without a human reading each one. Everything below uses MLflow's built-in judge APIs and runs on **Databricks managed MLflow**, which adds the production plumbing you'd otherwise build yourself: hosted tracking, a Review App for human labeling, and trace storage in Unity Catalog Delta tables — governed like any other data asset and queryable from notebooks, SQL, or dashboards.
+*A primer: MLflow is the open-source platform for the ML and GenAI lifecycle, and its tracing records every step an agent takes — LLM calls, tool calls, inputs, outputs. An LLM judge is a language model that grades another model's output against instructions you write, so you can score thousands of runs without reading each one. This demo runs on Databricks managed MLflow, which adds hosted tracking, a Review App for human labeling, and trace storage in Unity Catalog Delta tables.*
 
 ---
 
 ## A claim that should never have been fast-tracked
 
-A property & casualty insurer deploys an AI agent for first-notice-of-loss (FNOL) intake. The job is classic multimodal work: the agent ingests the claimant's damage photos, extracts fields from a scanned loss-notice form, reads the claimant's description of the incident, and produces two outputs that matter — a severity estimate and a routing decision. Minor claims go to fast-track settlement; everything else goes to an adjuster.
+An insurer runs an AI agent for first-notice-of-loss intake. It reads the claimant's damage photos, pulls fields off a scanned loss-notice form, and outputs two things: a severity estimate and a routing decision. Minor claims settle on the fast track. Everything else goes to an adjuster.
 
-Then claim CLM-1004 arrives. The claimant writes: *"Just a little fender bender in a parking lot, barely a scuff on the bumper. Should be a quick fix, hoping for fast-track processing."* The agent classifies it minor and fast-tracks it. Its rationale is perfectly professional: *"Claimant describes a parking lot fender bender with barely a scuff on the bumper, indicating cosmetic damage only."*
+Claim CLM-1004 arrives. The claimant writes: *"Just a little fender bender in a parking lot, barely a scuff on the bumper. Should be a quick fix, hoping for fast-track processing."* The agent calls it minor and fast-tracks it, with a reasonable-sounding rationale about cosmetic damage.
 
-The photo attached to the claim shows a shattered windshield and a crumpled, buckled hood.
+The attached photo shows a shattered windshield and a crumpled hood.
 
-Here is the uncomfortable part: this claim sailed through evaluation. The team's LLM judge — a standard text-based judge that reviews the agent's inputs and outputs — scored it a pass. And it *should* have, given what it could see: the claimant said minor, the agent said minor, the rationale was coherent. Every artifact the judge could read was consistent. The contradiction lived in the one artifact the judge couldn't read: the image.
+The claim passed evaluation. The team's LLM judge — text-based, reviewing inputs and outputs — scored it a pass, and given what it could read, it should have. The claimant said minor. The agent said minor. The rationale was coherent. The only thing that disagreed was the photo, and the judge couldn't open photos.
 
-That's the thesis of this post. **Text-only evaluation grades a multimodal agent with one eye closed.** If your agent consumes images and documents, a judge that consumes only text isn't a weaker version of the right eval — it's systematically miscalibrated, passing exactly the failures that matter most. Below we build this claims agent, wire up MLflow judges that can actually open the evidence, and run the same eval suite twice to show the difference.
+That's the problem. **If your agent reads images, a text-only judge isn't a weaker eval — it's a miscalibrated one**, passing exactly the failures that cost you money.
 
-## Why this was hard until now
+## Why this was hard until recently
 
-Anyone who traced a multimodal agent before MLflow 3.11 knows the failure mode: walls of base64. A single damage photo is a few hundred kilobytes of `iVBORw0KGgo…` sitting inline in a span's inputs. Multiply by every photo, every form scan, every LLM call, and traces balloon to megabytes — bloating the trace database, slowing search, and making visual debugging impossible. You could see *that* an image was sent. You couldn't see the image.
+Tracing a multimodal agent used to mean walls of base64. One damage photo is a few hundred kilobytes of `iVBORw0KGgo…` sitting inline in a span. Multiply that by every photo and every LLM call and traces balloon into megabytes. You could see that an image was sent. You couldn't see the image.
 
-MLflow's multimodal tracing changed the storage model. When autologging detects binary content in a span — an OpenAI-style `image_url` data URI, an Anthropic image block, raw bytes — it extracts the payload into the artifact store and leaves behind a lightweight reference:
+MLflow's multimodal tracing changed the storage model. When autologging spots binary content in a span, it extracts the payload to the artifact store and leaves a reference behind:
 
 ```
-mlflow-attachment://eb9ef8f4-…?content_type=image%2Fjpeg&size=109842
+mlflow-attachment://eb9ef8f4-...?content_type=image%2Fjpeg&size=109842
 ```
 
-The trace stays small, and the Trace UI fetches and renders photos, PDFs, and audio inline when a human opens the trace. That solved observability: people could finally see what the model saw.
+Traces stay small, and the UI renders the photo inline when a human opens it. That fixed observability for people. It did nothing for the judges that gate deployments — until MLflow 3.15 gave trace-based judges a `get_span_image` tool. Now a judge can pull image attachments out of a trace, hand them to a multimodal model, and reason about the pixels.
 
-But framing that as the destination undersells it. Inline rendering makes *humans* effective reviewers; it does nothing for the automated judges that gate your deployments and score your production traffic at scale. Until recently, `make_judge()` judges were text creatures — even a trace-based judge exploring spans could only read the textual residue of an image: file paths, captions, token counts. As of MLflow 3.15, trace-based judges get a `get_span_image` tool: the judge can fetch image attachments out of the trace's spans, pass them to a multimodal model, and reason about the pixels directly. The prerequisite (attachments) and the payoff (judges with eyes) finally connect.
+![Architecture](assets/diagram1_agent_tracing.svg)
 
-![FNOL agent architecture with multimodal tracing](assets/diagram1_agent_tracing.svg)
+*Evidence flows into the trace as attachments — visible to humans in the UI, and now to judges.*
 
-*Figure 1: The FNOL agent's evidence flows into MLflow traces as attachments — visible to humans in the Trace UI, and now to judges via `get_span_image`.*
+## The agent, bugs included
 
-## Building the agent — and keeping its bugs
+The demo agent processes eight synthetic claims built from a CC0 vehicle-damage dataset and generated claim forms. It ships with three deliberate bugs, the kind that pass code review because each looks like a cost optimization:
 
-Our demo agent processes eight synthetic claims built from a public-domain (CC0) vehicle-damage photo dataset plus programmatically generated "Automobile Loss Notice" form scans. (Real FNOL intake also includes call audio; we scope this series to text, images, and documents — audio evaluation is a different problem.) The agent is deliberately shipped with three bugs. Not cartoonish ones — the kind that pass code review because each looks like a sensible cost optimization:
+1. **Express lane.** Claims whose description sounds like a parking-lot fender bender skip photo review and get classified from the claimant's own words.
+2. **First photo only.** If a claimant submits three photos, one gets analyzed.
+3. **Form downscaling.** The scanned form is resized before extraction to save vision tokens.
 
-1. **The express lane.** Parking-lot fender benders are high-volume, low-value claims, so intake skips photo review entirely for claims whose description sounds like one, and trusts the claimant's own words.
-2. **First photo only.** When a claimant submits multiple photos, only the first gets analyzed.
-3. **Form downscaling.** The scanned claim form is resized before extraction to save vision tokens.
-
-The instrumentation is two lines plus one design decision. The two lines:
+Instrumentation is two lines, plus one design decision:
 
 ```python
-mlflow.set_experiment("/Users/…/claims_agent_exp")
-mlflow.openai.autolog()   # every vision LLM call → traced, images → attachments
+mlflow.set_experiment("/Users/.../claims_agent_exp")
+mlflow.openai.autolog()  # calls traced, images -> attachments
 ```
 
-The design decision is an `ingest_evidence` span that stores *all* submitted evidence on the trace, whether or not the agent later looks at it:
+The design decision is an `ingest_evidence` span that records everything the claimant submitted, whether or not the agent looks at it:
 
 ```python
 @mlflow.trace(name="ingest_evidence")
-def ingest_evidence(photo_paths: list, form_path: str) -> dict:
-    # Everything the claimant submitted lands on the trace as attachments —
-    # auto-extracted, rendered inline in the UI, fetchable by judges.
+def ingest_evidence(photo_paths, form_path):
     return {
-        "photos": [{"path": p, "image": _img_content(p)} for p in photo_paths],
-        "form":   {"path": form_path, "image": _img_content(form_path)},
+        "photos": [{"path": p, "image": _img(p)}
+                   for p in photo_paths],
+        "form": {"path": form_path,
+                 "image": _img(form_path)},
     }
-
-@mlflow.trace(name="process_claim")
-def process_claim(claim_id, description, photo_paths, form_path) -> dict:
-    ingest_evidence(photo_paths, form_path)
-    fields = extract_form_fields(form_path)          # vision LLM on the scan
-    if any(k in description.lower() for k in EXPRESS_LANE_KEYWORDS):
-        photo_analysis = "(photo review skipped — express lane triage)"   # BUG 1
-    else:
-        photo_analysis = analyze_damage_photo(photo_paths[0])             # BUG 2
-    assessment = assess_severity(description, photo_analysis)
-    route = "fast_track" if assessment["severity"] == "minor" else "adjuster_review"
-    return {"claim_id": claim_id, "severity": assessment["severity"],
-            "routing": route, "rationale": assessment["rationale"],
-            "extracted_fields": fields}
 ```
 
-This pattern matters beyond the demo. In a regulated workflow, the evidence record should be complete even when the automation takes a shortcut — *especially* when the automation takes a shortcut. Because `ingest_evidence` runs unconditionally, the photo the express lane never opened is still sitting on CLM-1004's trace. The agent didn't look at it. Something else can.
+This matters beyond the demo. In a regulated workflow the evidence record should be complete even when the automation cuts a corner — especially then. Because that span runs unconditionally, the photo the express lane skipped is still on CLM-1004's trace. The agent didn't look at it. Something else can.
 
-![Trace inputs and judge assessments in the MLflow UI](assets/screenshot_trace_inputs.png)
+## Judges that open the evidence
 
-*Figure 2: CLM-1004's trace in the MLflow UI — the claimant's description, submitted photos, and (right) six judge verdicts attached as feedback.*
-
-## Judges that inspect the evidence
-
-MLflow's `make_judge()` builds judges from natural-language instructions. Give the instructions a `{{ trace }}` template variable and the judge becomes agentic: it explores spans with tools, and — since 3.15 — those tools include `get_span_image`. Here is the severity judge, condensed:
+`make_judge()` builds judges from plain instructions. Give them a `{{ trace }}` variable and the judge explores spans with tools, including `get_span_image`:
 
 ```python
-from mlflow.genai.judges import make_judge
-from typing import Literal
-
 damage_fidelity_vision = make_judge(
     name="damage_fidelity_vision",
     instructions=(
-        "You are auditing an auto insurance FNOL agent. Analyze the {{ trace }}.\n\n"
-        "The agent classified the claim's damage severity (process_claim output). "
-        "Verify it against the ACTUAL DAMAGE PHOTOS in the trace.\n\n"
-        "Use the get_span_image tool to fetch and inspect EVERY damage photo. The "
-        "ingest_evidence span contains ALL photos the claimant submitted; the "
-        "analyze_damage_photo spans contain only the ones the agent reviewed.\n\n"
-        "Severity rubric: minor = cosmetic; moderate = significant panel damage, "
-        "drivable; severe = structural/frame damage, not safely drivable.\n\n"
-        "Borderline calls one category apart should pass. Return 'fail' only when "
-        "the photos CLEARLY contradict the agent. In your rationale, describe what "
+        "You are auditing an FNOL agent. Analyze the "
+        "{{ trace }}. Verify the agent's severity call "
+        "against the ACTUAL DAMAGE PHOTOS.\n"
+        "Use get_span_image to inspect EVERY photo. "
+        "ingest_evidence holds all submitted photos; "
+        "analyze_damage_photo spans hold only the ones "
+        "the agent reviewed.\n"
+        "minor = cosmetic; moderate = panel damage, "
+        "drivable; severe = structural, not drivable.\n"
+        "Calls one category apart pass. Describe what "
         "you SAW in the photos."
     ),
     feedback_value_type=Literal["pass", "fail"],
@@ -114,76 +91,56 @@ damage_fidelity_vision = make_judge(
 )
 ```
 
-Three details are doing quiet work here. The judge is told *where the images live* (evidence-ingest span vs. analysis spans) — that's what lets it compare what was submitted against what was reviewed. It gets the *same severity rubric the business uses*, with an explicit adjacent-category tolerance so it doesn't nitpick borderline minor-vs-moderate calls. And it must *describe what it saw*, which turns every verdict into an evidence-citing record rather than a bare score.
+Three things are doing the work. The judge is told where the images live, which lets it compare what was submitted against what was reviewed. It gets the same rubric the business uses, with explicit tolerance for borderline calls. And it has to describe what it saw, which turns each verdict into a record instead of a score.
 
-Two more judges complete the suite: **extraction accuracy** (fetch the form scan, read it, compare every extracted field against what's printed) and **process completeness** (count submitted photos, count `analyze_damage_photo` spans, fail if any photo was never analyzed — a pure process check that doesn't second-guess the agent's conclusion at all).
+Two more judges complete the suite: **extraction accuracy** reads the form scan and checks every extracted field, and **process completeness** counts submitted photos against `analyze_damage_photo` spans. For comparison we built the same three as text-only judges, and were generous with them — they're told they can't see photos and should fail only on clear inconsistency.
 
-For the comparison, we also built the same three judges the way most teams build them today: text-only, seeing `{{ inputs }}` and `{{ outputs }}`. We were generous with them — they're instructed that they can't see the photos and should fail only on clear internal inconsistency. Running both suites over the same eight traces is one call each:
+![Two judges](assets/diagram2_judges.svg)
 
-```python
-mlflow.genai.evaluate(data=traces, scorers=[damage_fidelity_vision,
-                                            extraction_accuracy_vision,
-                                            process_check_vision])
-mlflow.genai.evaluate(data=traces, scorers=[damage_fidelity_text,
-                                            extraction_accuracy_text,
-                                            process_check_text])
-```
-
-![Text judge vs vision judge on the same trace](assets/diagram2_judges.svg)
-
-*Figure 3: Same trace, two judges. The text judge sees a consistent story. The vision judge sees the car.*
+*Same trace, two judges. One reads the transcript; the other opens the photo.*
 
 ## The same eval, run twice
 
-Eight claims: five controls the agent handles reasonably, two seeded severity failures, and one claim with a subtle document-extraction error. Here's what each judge suite caught:
+Eight claims: five the agent handles reasonably, two seeded severity failures, one with a document-extraction error.
 
-| Claim | What actually happened | Text judge (damage) | Vision judge (damage) | Text judge (process) | Vision judge (process) |
-|---|---|---|---|---|---|
-| CLM-1001 | Minor scrape, borderline over-call, routed safely | **fail** ⚠️ | pass | pass | pass |
-| CLM-1002 | Minor dent, borderline over-call, routed safely | **fail** ⚠️ | pass | **fail** ⚠️ | pass |
-| CLM-1003 | Severe collision, routed to adjuster | pass | pass | pass | pass |
-| **CLM-1004** | **Severe damage fast-tracked on claimant's say-so** | **pass** 🚨 | **fail** ✓ | fail | **fail** ✓ |
-| **CLM-1005** | **Severe damage in the 2nd photo, never opened** | fail | **fail** ✓ | fail | **fail** ✓ |
-| CLM-1006 | Minor scrape, handled within tolerance | pass | pass | pass | pass |
-| CLM-1007 | Moderate damage, routed to adjuster | **fail** ⚠️ | pass | **fail** ⚠️ | pass |
-| CLM-1008 | Borderline moderate/severe, routed to adjuster | **fail** ⚠️ | pass | pass | pass |
+![Results](assets/table_results_part1.png)
 
-🚨 = missed a real failure  ⚠️ = false alarm on a claim handled correctly  ✓ = caught a seeded failure
+The vision suite is clean. It fails the two claims where the photos contradict the agent, flags the two where submitted photos went unreviewed, and passes every control. The text suite fails in both directions: it waves through CLM-1004, the one failure with real financial consequences, and raises false alarms on claims the agent got right. That second part is the underrated cost. A text judge can only compare the agent's output to the claimant's story, so when the agent correctly overrides a claimant, the text judge punishes it.
 
-The vision suite is clean: it fails exactly the two claims where the agent's severity call is contradicted by the photos, flags exactly the two claims where submitted photos went unreviewed, and passes every control. The text suite is broken in *both* directions — it waves through CLM-1004, the one failure with real financial and safety consequences, while raising false alarms on claims the agent handled correctly. That second half is worth dwelling on: a text judge can only measure the agent's output against the claimant's story, so when the agent correctly *overrides* a claimant (as it did on several controls), the text judge punishes it. Blind *and* noisy is a bad combination for a deployment gate.
+Because vision judges write their reasoning back to the trace, the verdicts are auditable. On CLM-1004:
 
-And because vision judges write their reasoning back to the trace as assessments, the verdicts are auditable. This is the actual rationale the damage judge attached to CLM-1004:
+> *"...the actual damage photo reveals SEVERE damage that directly contradicts this classification. The photo shows: (1) a completely shattered windshield with spider-web cracking across the entire surface, (2) significant hood crumpling and buckling indicating structural damage..."*
 
-> "The agent classified this claim as 'minor' severity based solely on the claimant's description ('barely a scuff on the bumper'), but the actual damage photo reveals SEVERE damage that directly contradicts this classification. The photo shows: (1) a completely shattered windshield with spider-web cracking across the entire surface, (2) significant hood crumpling and buckling indicating structural damage…"
+The process judge, same claim:
 
-The process judge, on the same claim:
+> *"...1 photo was submitted, but zero analyze_damage_photo spans were executed."*
 
-> "…1 photo was submitted, but zero analyze_damage_photo spans were executed. Instead, the assess_severity span received 'photo_analysis': '(photo review skipped — express lane triage)'…"
+And the extraction judge caught something nobody planted. Reading the form scan, it found a single-character VIN misread:
 
-And the extraction judge caught something nobody seeded on purpose — reading the actual form scan, it found the agent had misread one character of a 17-character VIN:
+> *"The form shows '1FMCU9G61LUA44873'... but the agent extracted '1FMCU9GG1LUA44873'..."*
 
-> "The form shows '1FMCU9G61LUA44873' (with a '6' in the 8th character position), but the agent extracted '1FMCU9GG1LUA44873'…"
+On CLM-1005 the judge fetched the second photo — the one the agent never opened — and reported *"SEVERE, EXTENSIVE FIRE DAMAGE covering the entire driver's side."* Three independent checks, all failing with photographic evidence, on a trace the text eval marked green.
 
-On CLM-1005, the judge fetched the second photo — the one the agent never opened — and reported *"SEVERE, EXTENSIVE FIRE DAMAGE covering the entire driver's side."* One claim, three independent checks, all failing with photographic evidence attached, on a trace a text-only eval had marked green.
+![CLM-1004 verdicts](assets/screenshot_verdicts_panel.png)
 
-![CLM-1004: text judges pass, vision judges fail, on the same trace](assets/screenshot_verdicts_panel.png)
+*CLM-1004: text judges pass, all three vision judges fail.*
 
-*Figure 4: The money shot. CLM-1004's trace with six verdicts side by side: `damage_fidelity_text: pass`, `extraction_accuracy_text: pass` — while all three vision judges fail, with rationales citing the image. Total agent cost for this trace: about half a cent.*
+## What it costs
 
-## What this costs, honestly
+Vision judges aren't free. An agentic trace judge makes several model calls per trace where a text judge makes one, and vision tokens cost more. In our runs the vision pass cost several times its text equivalent (for scale, the agent processes a whole claim, three vision calls included, for about half a cent).
 
-Vision judges are not free. An agentic trace judge makes multiple model calls per trace — exploring spans, fetching images, reasoning over them — where a text judge makes one, and vision tokens price higher than text. In our runs the three-judge vision pass cost several times its text equivalent per trace (for scale: the *agent* processes an entire claim, three vision calls included, for about half a cent on `claude-sonnet-4-5`). The pattern that follows is the standard one: run vision judges *exhaustively* where the stakes justify it — CI gates, pre-deployment regression suites, and any trace a business rule flags — and *sample* them for production monitoring, with text judges or cheap heuristics as the first-pass filter. What you should not do is let the cost argument quietly reintroduce the blind spot: a text judge sampled at 100% still catches zero CLM-1004s.
+The usual pattern applies: run vision judges exhaustively where the stakes justify it — CI gates, pre-deployment suites, anything a business rule flags — and sample them in production monitoring behind a cheap first-pass filter. What you shouldn't do is let the cost argument quietly restore the blind spot. A text judge sampled at 100% still catches zero CLM-1004s.
 
-The pattern generalizes past insurance. Computer-use agents whose traces are screenshots; retail catalog agents matching product images to listings; medical intake pipelines reading faxed referrals — in every case the input is visual, the transcript can look impeccable, and the failure only exists in the pixels. If the input is visual, the eval must be visual.
+This generalizes past insurance. Computer-use agents whose traces are screenshots, retail agents matching product images to listings, medical intake reading faxed referrals — the input is visual, the transcript looks fine, and the failure only exists in the pixels.
 
-## We've replaced one trust problem with another
+## We traded one trust problem for another
 
-Step back and look at what we actually shipped. An LLM agent was making unsupervised severity calls, so we put an LLM judge over it. The judge just declared, in writing, that a car has severe structural damage — and that verdict now gates deployments and flags production traffic. In a regulated industry, a compliance officer has an obvious next question: *who signed off on the judge?* What's the evidence that its severity calls match what a licensed adjuster would say? On which damage types does it disagree with your experts, and how often?
+Look at what we shipped. An LLM agent was making unsupervised severity calls, so we put an LLM judge over it. That judge now declares in writing that a car has structural damage, and its verdict gates deployments.
 
-We gave the judge eyes. We haven't given anyone a reason to trust them. An uncalibrated judge is just a second opinion from a stranger — and "we use AI to check our AI" is not a model-risk-management story. Turning it into one requires measuring the judge against human experts, systematically improving the agreement, and keeping the receipts.
+A compliance officer's next question is obvious: who signed off on the judge? What evidence is there that its severity calls match a licensed adjuster's? Where does it disagree with your experts, and how often?
 
-That's Part 2: *Who Audits the Judge? Calibrating LLM judges for regulated AI* — expert labeling with MLflow review queues (where Part 1's inline image rendering turns out to be the thing that makes visual labeling possible at all), agreement measurement, and judge alignment. Same insurer, same claims, three months later — when a senior adjuster reviews a sample of the judge's calls and disagrees with 30% of them.
+We gave the judge eyes. We haven't given anyone a reason to trust them. That's Part 2: expert labeling with MLflow review queues, agreement measurement, and judge alignment — where a senior adjuster reviews the judge's calls and disagrees with 30% of them.
 
 ---
 
-*The demo — dataset builder, agent, and both judge suites — is a three-notebook MLflow project; the full code, notebooks, and figures for the whole series (including Part 2's calibration workflow) are at [github.com/Anubhav02/Mlflow_vision](https://github.com/Anubhav02/Mlflow_vision). Damage photos are from the Humans in the Loop "Car Parts and Car Damages" dataset (CC0 1.0, public domain); claim forms are synthetic. Requires MLflow ≥ 3.15.*
+*Code, notebooks, and figures: [github.com/Anubhav02/Mlflow_vision](https://github.com/Anubhav02/Mlflow_vision). Requires MLflow >= 3.15. Damage photos are from the Humans in the Loop "Car Parts and Car Damages" dataset (CC0 1.0); claim forms are synthetic.*
